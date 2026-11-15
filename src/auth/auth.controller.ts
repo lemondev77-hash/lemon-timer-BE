@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Patch, Body, Param } from '@nestjs/common';
+import { Controller, Post, Get, Patch, Body, Param, Headers } from '@nestjs/common';
 import { AuthService } from './auth.service.js';
 
 @Controller('auth')
@@ -13,6 +13,11 @@ export class AuthController {
   @Post('login')
   login(@Body() body: { username: string; password: string }) {
     return this.authService.login(body.username, body.password);
+  }
+
+  @Get('me')
+  getMe(@Headers('authorization') authHeader?: string) {
+    return this.authService.getMe(authHeader);
   }
 
   @Get('profile/:userId')
