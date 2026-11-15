@@ -1,381 +1,383 @@
 import {
+  ConnectedSocket,
+  MessageBody,
+  OnGatewayDisconnect,
+  SubscribeMessage,
   WebSocketGateway,
   WebSocketServer,
-  SubscribeMessage,
-  MessageBody,
-  ConnectedSocket,
-  OnGatewayDisconnect,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { RankedService } from './ranked.service.js';
 
-interface QueuedPlayer {
+interface RoomPlayer {
   socketId: string;
   userId: string;
-  username: string;
+  name: string;
   elo: number;
+  score: number;
 }
 
-interface ActiveSubmission {
-  timeMs: number;
-  penalty: 'NONE' | '+2' | 'DNF';
-}
-
-interface ActiveMatch {
-  
-  matchId: string;
-  roundId: string;
-  roundNumber: number;
+interface MatchRoom {
+  roomCode: string;
+  event: string;
+  bestOf: 3 | 5;
+  round: number;
   scramble: string;
-  player1: QueuedPlayer & { score: number; status: string };
-  player2: QueuedPlayer & { score: number; status: string };
-  submissions: Record<string, ActiveSubmission>;
+  players: RoomPlayer[];
+  roundTimes: Record<string, number>;
 }
 
-@WebSocketGateway({ cors: { origin: '*' } })
-export class RankedGateway implements OnGatewayDisconnect {
+function generateScramble(event: string): string {
+  const rand = <T>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
+  const faces =
+    event === '222'
+      ? ['U', 'R', 'F']
+      : event === 'pyram' || event === 'skewb'
+        ? ['U', 'L', 'R', 'B']
+        : ['U', 'D', 'L', 'R', 'F', 'B'];
+  const mods =
+    event === 'pyram' || event === 'skewb' ? ['', "'"] : ['', "'", '2'];
+  const len = event === '222' ? 9 : event === '444' ? 36 : 20;
+
+  const moves: string[] = [];
+  let last = '';
+  for (let i = 0; i < len; i++) {
+    const f = rand(faces.filter((x) => x !== last));
+    last = f;
+    moves.push(`${f}${rand(mods)}`);
+  }
+  return moves.join(' ');
+}
+
+@WebSocketGateway({
+  cors: {
+    origin: '*',
+  },
+})
+export class MatchGateway implements OnGatewayDisconnect {
   @WebSocketServer()
-  server!: Server;
+  server: Server;
 
-  private queue: QueuedPlayer[] = [];
-  private activeMatches = new Map<string, ActiveMatch>();
-  private botTimers = new Map<string, NodeJS.Timeout[]>();
+  private rooms = new Map<string, MatchRoom>();
+  private socketToRoom = new Map<string, string>();
+  private quickQueue = new Map<
+    string,
+    { socketId: string; userId: string; name: string; elo: number; event: string }
+  >();
 
-  constructor(private readonly rankedService: RankedService) {}
+  handleDisconnect(client: Socket) {
+    this.quickQueue.delete(client.id);
 
-  private clearBotTimers(matchId: string) {
-    const timers = this.botTimers.get(matchId);
-    if (timers) {
-      timers.forEach((t) => clearTimeout(t));
-      this.botTimers.delete(matchId);
-    }
+    const roomCode = this.socketToRoom.get(client.id);
+    if (!roomCode) return;
+
+    this.socketToRoom.delete(client.id);
+    const room = this.rooms.get(roomCode);
+    if (!room) return;
+
+    client.to(roomCode).emit('opponent_left');
+    this.rooms.delete(roomCode);
   }
 
-  private scheduleBotTurn(matchId: string) {
-    this.clearBotTimers(matchId);
-    const botSolveMs = Math.floor(11000 + Math.random() * 7000); // Bot giải từ 11s - 18s
-
-    const t1 = setTimeout(() => {
-      if (!this.activeMatches.has(matchId)) return;
-      this.server.to(matchId).emit('opponent_status', {
-        userId: 'bot_ai',
-        status: 'INSPECTING',
-      });
-    }, 1500);
-
-    const t2 = setTimeout(() => {
-      if (!this.activeMatches.has(matchId)) return;
-      this.server.to(matchId).emit('opponent_status', {
-        userId: 'bot_ai',
-        status: 'SOLVING',
-      });
-    }, 4500);
-
-    const t3 = setTimeout(() => {
-      if (!this.activeMatches.has(matchId)) return;
-      this.handleSubmitSolve({
-        matchId,
-        userId: 'bot_ai',
-        timeMs: botSolveMs,
-        penalty: 'NONE',
-      });
-    }, 4500 + botSolveMs);
-
-    this.botTimers.set(matchId, [t1, t2, t3]);
-  }
-
-  @SubscribeMessage('join_bot_match')
-  async handleJoinBotMatch(
+  /** 1. Tạo phòng thi đấu riêng */
+  @SubscribeMessage('create_room')
+  handleCreateRoom(
     @ConnectedSocket() client: Socket,
-    @MessageBody() payload: { userId: string; username: string; elo: number },
+    @MessageBody() payload: any,
   ) {
-    const created = await this.rankedService.createMatch(payload.userId, 'bot_ai');
+    const roomCode = String(
+      payload?.roomCode || Math.random().toString(36).substring(2, 8),
+    )
+      .trim()
+      .toUpperCase();
 
-    const match: ActiveMatch = {
-      matchId: created.matchId,
-      roundId: created.roundId,
-      roundNumber: 1,
-      scramble: created.scramble,
-      player1: {
-        socketId: client.id,
-        userId: payload.userId,
-        username: payload.username,
-        elo: payload.elo,
-        score: 0,
-        status: 'READY',
-      },
-      player2: {
-        socketId: 'bot',
-        userId: 'bot_ai',
-        username: 'LemonBot (AI)',
-        elo: payload.elo,
-        score: 0,
-        status: 'READY',
-      },
-      submissions: {},
+    const event = String(payload?.event || '333');
+    const bestOf: 3 | 5 = payload?.bestOf === 3 ? 3 : 5;
+
+    const room: MatchRoom = {
+      roomCode,
+      event,
+      bestOf,
+      round: 1,
+      scramble: generateScramble(event),
+      players: [
+        {
+          socketId: client.id,
+          userId: String(payload?.userId || client.id),
+          name: String(payload?.name || 'Chủ phòng'),
+          elo: Number(payload?.elo ?? 1200),
+          score: 0,
+        },
+      ],
+      roundTimes: {},
     };
 
-    this.activeMatches.set(match.matchId, match);
-    client.join(match.matchId);
-
-    client.emit('match_found', {
-      matchId: match.matchId,
-      roundNumber: 1,
-      scramble: match.scramble,
-      player1: {
-        userId: match.player1.userId,
-        username: match.player1.username,
-        elo: match.player1.elo,
-        score: 0,
-      },
-      player2: {
-        userId: match.player2.userId,
-        username: match.player2.username,
-        elo: match.player2.elo,
-        score: 0,
-      },
-    });
-
-    this.scheduleBotTurn(match.matchId);
+    this.rooms.set(roomCode, room);
+    this.socketToRoom.set(client.id, roomCode);
+    client.join(roomCode);
+    client.emit('room_created', { roomCode, event, bestOf });
+    return { ok: true, roomCode };
   }
 
-  private getEffectiveMs(sub: ActiveSubmission): number {
-    if (sub.penalty === 'DNF') return Number.MAX_SAFE_INTEGER;
-    return sub.penalty === '+2' ? sub.timeMs + 2000 : sub.timeMs;
-  }
-
-  @SubscribeMessage('join_queue')
-  async handleJoinQueue(
+  /** 2. Vào phòng thi đấu bằng mã 6 ký tự */
+  @SubscribeMessage('join_room')
+  handleJoinRoom(
     @ConnectedSocket() client: Socket,
-    @MessageBody() payload: { userId: string; username: string; elo: number },
+    @MessageBody() payload: any,
   ) {
-    // Loại bỏ nếu user này đang nằm sẵn trong hàng chờ
-    this.queue = this.queue.filter(
-      (p) => p.userId !== payload.userId && p.socketId !== client.id,
-    );
+    const roomCode = String(payload?.roomCode || '').trim().toUpperCase();
+    const room = this.rooms.get(roomCode);
 
-    const player: QueuedPlayer = {
-      socketId: client.id,
-      userId: payload.userId,
-      username: payload.username,
-      elo: payload.elo,
-    };
-
-    if (this.queue.length === 0) {
-      this.queue.push(player);
-      client.emit('queue_waiting', { position: 1 });
+    if (!room) {
+      client.emit('room_error', {
+        message: `Không tìm thấy phòng có mã ${roomCode}`,
+      });
       return;
     }
 
-    // Ghép cặp với người đang chờ lâu nhất
-    const opponent = this.queue.shift()!;
-    const created = await this.rankedService.createMatch(
-      opponent.userId,
-      player.userId,
-    );
+    if (room.players.length >= 2) {
+      client.emit('room_error', {
+        message: 'Phòng này đã đủ 2 người chơi!',
+      });
+      return;
+    }
 
-    const match: ActiveMatch = {
-      matchId: created.matchId,
-      roundId: created.roundId,
-      roundNumber: 1,
-      scramble: created.scramble,
-      player1: { ...opponent, score: 0, status: 'READY' },
-      player2: { ...player, score: 0, status: 'READY' },
-      submissions: {},
+    const joiner: RoomPlayer = {
+      socketId: client.id,
+      userId: String(payload?.userId || client.id),
+      name: String(payload?.name || 'Đối thủ'),
+      elo: Number(payload?.elo ?? 1200),
+      score: 0,
     };
 
-    this.activeMatches.set(match.matchId, match);
+    room.players.push(joiner);
+    this.socketToRoom.set(client.id, roomCode);
+    client.join(roomCode);
 
-
-    const oppSocket = this.server.sockets.sockets.get(opponent.socketId);
-    oppSocket?.join(match.matchId);
-    client.join(match.matchId);
-
-    this.server.to(match.matchId).emit('match_found', {
-      matchId: match.matchId,
-      roundNumber: 1,
-      scramble: match.scramble,
-      player1: {
-        userId: match.player1.userId,
-        username: match.player1.username,
-        elo: match.player1.elo,
-        score: 0,
-      },
-      player2: {
-        userId: match.player2.userId,
-        username: match.player2.username,
-        elo: match.player2.elo,
-        score: 0,
-      },
+    this.server.to(roomCode).emit('match_started', {
+      roomCode: room.roomCode,
+      event: room.event,
+      bestOf: room.bestOf,
+      round: room.round,
+      scramble: room.scramble,
+      players: room.players,
     });
   }
 
-  @SubscribeMessage('leave_queue')
-  handleLeaveQueue(@ConnectedSocket() client: Socket) {
-    this.queue = this.queue.filter((p) => p.socketId !== client.id);
-    client.emit('queue_left');
-  }
-
-  @SubscribeMessage('player_status')
-  handlePlayerStatus(
+  /** 3. Ghép trận Rank ngẫu nhiên */
+  @SubscribeMessage('find_match')
+  handleFindMatch(
     @ConnectedSocket() client: Socket,
-    @MessageBody() payload: { matchId: string; userId: string; status: string },
+    @MessageBody() payload: any,
   ) {
-    client.to(payload.matchId).emit('opponent_status', {
-      userId: payload.userId,
-      status: payload.status,
+    const event = String(payload?.event || '333');
+    const userId = String(payload?.userId || client.id);
+    const name = String(payload?.name || 'Cuber');
+    const elo = Number(payload?.elo ?? 1200);
+
+    let matchedEntry: {
+      socketId: string;
+      userId: string;
+      name: string;
+      elo: number;
+      event: string;
+    } | null = null;
+
+    for (const [sockId, entry] of this.quickQueue.entries()) {
+      if (sockId !== client.id && entry.event === event) {
+        matchedEntry = entry;
+        break;
+      }
+    }
+
+    if (!matchedEntry) {
+      this.quickQueue.set(client.id, {
+        socketId: client.id,
+        userId,
+        name,
+        elo,
+        event,
+      });
+      return;
+    }
+
+    this.quickQueue.delete(matchedEntry.socketId);
+    const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const scramble = generateScramble(event);
+
+    const room: MatchRoom = {
+      roomCode,
+      event,
+      bestOf: 5,
+      round: 1,
+      scramble,
+      players: [
+        {
+          socketId: matchedEntry.socketId,
+          userId: matchedEntry.userId,
+          name: matchedEntry.name,
+          elo: matchedEntry.elo,
+          score: 0,
+        },
+        {
+          socketId: client.id,
+          userId,
+          name,
+          elo,
+          score: 0,
+        },
+      ],
+      roundTimes: {},
+    };
+
+    this.rooms.set(roomCode, room);
+    this.socketToRoom.set(matchedEntry.socketId, roomCode);
+    this.socketToRoom.set(client.id, roomCode);
+
+    const opponentSocket = this.server.sockets.sockets.get(matchedEntry.socketId);
+    opponentSocket?.join(roomCode);
+    client.join(roomCode);
+
+    this.server.to(roomCode).emit('match_started', {
+      roomCode,
+      event,
+      bestOf: 5,
+      round: 1,
+      scramble,
+      players: room.players,
     });
   }
 
-  @SubscribeMessage('submit_solve')
-  async handleSubmitSolve(
-    @MessageBody()
-    payload: {
-      matchId: string;
-      userId: string;
-      timeMs: number;
-      penalty: 'NONE' | '+2' | 'DNF';
-    },
+  @SubscribeMessage('cancel_find_match')
+  handleCancelFindMatch(@ConnectedSocket() client: Socket) {
+    this.quickQueue.delete(client.id);
+  }
+
+  /** 4. Báo trạng thái đang bấm giờ cho đối thủ */
+  @SubscribeMessage('player_solving')
+  handlePlayerSolving(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: any,
   ) {
-    const match = this.activeMatches.get(payload.matchId);
-    if (!match) return;
+    const roomCode = String(
+      payload?.roomCode || this.socketToRoom.get(client.id) || '',
+    ).toUpperCase();
+    if (!roomCode) return;
+    client.to(roomCode).emit('opponent_solving');
+  }
 
-    match.submissions[payload.userId] = {
-      timeMs: payload.timeMs,
-      penalty: payload.penalty,
-    };
+  /** 5. Nộp thành tích mỗi ván & Tính điểm Bo3/Bo5 */
+  @SubscribeMessage('submit_solve')
+  handleSubmitSolve(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: any,
+  ) {
+    const roomCode = String(
+      payload?.roomCode || this.socketToRoom.get(client.id) || '',
+    ).toUpperCase();
+    const room = this.rooms.get(roomCode);
+    if (!room) return;
 
-    // Báo cho đối thủ biết người này đã hoàn thành ván
-    this.server.to(match.matchId).emit('opponent_status', {
-      userId: payload.userId,
-      status: 'SUBMITTED',
+    const player =
+      room.players.find((p) => p.socketId === client.id) ||
+      room.players.find((p) => p.userId === String(payload?.userId));
+    if (!player) return;
+
+    const timeMs = Number(payload?.timeMs ?? 0);
+    room.roundTimes[player.userId] = timeMs;
+
+    client.to(roomCode).emit('opponent_finished', {
+      userId: player.userId,
+      timeMs,
     });
 
-    const p1Sub = match.submissions[match.player1.userId];
-    const p2Sub = match.submissions[match.player2.userId];
-
-    // Chờ cả 2 người cùng nộp kết quả ván hiện tại
-    if (!p1Sub || !p2Sub) return;
-
-    const p1Eff = this.getEffectiveMs(p1Sub);
-    const p2Eff = this.getEffectiveMs(p2Sub);
+    // Chờ đủ cả 2 người nộp giờ
+    if (room.players.length < 2) return;
+    const [p1, p2] = room.players;
+    const t1 = room.roundTimes[p1.userId];
+    const t2 = room.roundTimes[p2.userId];
+    if (t1 === undefined || t2 === undefined) return;
 
     let roundWinnerId: string | null = null;
-    if (p1Eff < p2Eff) {
-      match.player1.score += 1;
-      roundWinnerId = match.player1.userId;
-    } else if (p2Eff < p1Eff) {
-      match.player2.score += 1;
-      roundWinnerId = match.player2.userId;
+    if (t1 < t2) {
+      p1.score += 1;
+      roundWinnerId = p1.userId;
+    } else if (t2 < t1) {
+      p2.score += 1;
+      roundWinnerId = p2.userId;
     }
 
-    await this.rankedService.saveRoundResult(
-      match.matchId,
-      match.roundId,
-      { userId: match.player1.userId, ...p1Sub },
-      { userId: match.player2.userId, ...p2Sub },
-      roundWinnerId,
-      match.player1.score,
-      match.player2.score,
-    );
+    const winTarget = Math.ceil(room.bestOf / 2);
+    let matchWinnerId: string | null = null;
+    const newElo: Record<string, number> = {};
 
-    const roundSummary = {
-      roundNumber: match.roundNumber,
-      roundWinnerId,
-      p1Result: { userId: match.player1.userId, ...p1Sub },
-      p2Result: { userId: match.player2.userId, ...p2Sub },
-      p1Score: match.player1.score,
-      p2Score: match.player2.score,
-    };
+    if (p1.score >= winTarget) {
+      matchWinnerId = p1.userId;
+      newElo[p1.userId] = p1.elo + 15;
+      newElo[p2.userId] = Math.max(800, p2.elo - 15);
+    } else if (p2.score >= winTarget) {
+      matchWinnerId = p2.userId;
+      newElo[p2.userId] = p2.elo + 15;
+      newElo[p1.userId] = Math.max(800, p1.elo - 15);
+    }
 
-    // Kiểm tra điều kiện thắng Bo5 (chạm 3 điểm trước)
-    if (match.player1.score >= 3 || match.player2.score >= 3) {
-      const p1Won = match.player1.score >= 3;
-      const winner = p1Won ? match.player1 : match.player2;
-      const loser = p1Won ? match.player2 : match.player1;
+    const finishedScramble = room.scramble;
+    const finishedRound = room.round;
+    const roundTimesSnapshot = { ...room.roundTimes };
 
-      const eloRes = await this.rankedService.finalizeMatchAndElo(
-        match.matchId,
-        winner.userId,
-        loser.userId,
-        winner.elo,
-        loser.elo,
-      );
-
-      this.server.to(match.matchId).emit('match_ended', {
-        ...roundSummary,
-        winnerId: winner.userId,
-        winnerName: winner.username,
-        eloDelta: eloRes.delta,
-        newElos: {
-          [winner.userId]: eloRes.newWinnerElo,
-          [loser.userId]: eloRes.newLoserElo,
+    if (matchWinnerId) {
+      this.server.to(roomCode).emit('round_result', {
+        round: finishedRound,
+        scramble: finishedScramble,
+        times: roundTimesSnapshot,
+        scores: {
+          [p1.userId]: p1.score,
+          [p2.userId]: p2.score,
         },
+        roundWinnerId,
+        matchWinnerId,
+        newElo,
       });
 
-      this.activeMatches.delete(match.matchId);
+      this.socketToRoom.delete(p1.socketId);
+      this.socketToRoom.delete(p2.socketId);
+      this.rooms.delete(roomCode);
       return;
     }
 
-    // Chưa ai chạm 3 điểm -> Sinh Scramble cho ván kế tiếp
-    const nextRoundNumber = match.roundNumber + 1;
-    const nextRound = await this.rankedService.createNextRound(
-      match.matchId,
-      nextRoundNumber,
-    );
+    // Sang ván tiếp theo
+    room.round += 1;
+    room.roundTimes = {};
+    room.scramble = generateScramble(room.event);
 
-    match.roundNumber = nextRoundNumber;
-    match.roundId = nextRound.roundId;
-    match.scramble = nextRound.scramble;
-    match.submissions = {};
-
-    this.server.to(match.matchId).emit('next_round', {
-      ...roundSummary,
-      nextRoundNumber,
-      nextScramble: nextRound.scramble,
+    this.server.to(roomCode).emit('round_result', {
+      round: finishedRound,
+      scramble: finishedScramble,
+      times: roundTimesSnapshot,
+      scores: {
+        [p1.userId]: p1.score,
+        [p2.userId]: p2.score,
+      },
+      roundWinnerId,
+      matchWinnerId: null,
+      nextRound: room.round,
+      nextScramble: room.scramble,
     });
   }
 
-  async handleDisconnect(client: Socket) {
-    // Xóa khỏi hàng chờ nếu thoát app lúc tìm trận
-    this.queue = this.queue.filter((p) => p.socketId !== client.id);
-    
-    // Nếu thoát giữa trận -> Xử thua đối thủ thoát và cộng Elo cho người ở lại
-    for (const [matchId, match] of this.activeMatches.entries()) {
-      const isP1 = match.player1.socketId === client.id;
-      const isP2 = match.player2.socketId === client.id;
-      if (!isP1 && !isP2) continue;
+  /** 6. Rời phòng chủ động */
+  @SubscribeMessage('leave_room')
+  handleLeaveRoom(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: any,
+  ) {
+    const roomCode = String(
+      payload?.roomCode || this.socketToRoom.get(client.id) || '',
+    ).toUpperCase();
+    if (!roomCode) return;
 
-      const winner = isP1 ? match.player2 : match.player1;
-      const loser = isP1 ? match.player1 : match.player2;
-
-      const eloRes = await this.rankedService.finalizeMatchAndElo(
-        matchId,
-        winner.userId,
-        loser.userId,
-        winner.elo,
-        loser.elo,
-      );
-
-      this.server.to(matchId).emit('match_ended', {
-        roundNumber: match.roundNumber,
-        roundWinnerId: winner.userId,
-        p1Score: match.player1.score,
-        p2Score: match.player2.score,
-        winnerId: winner.userId,
-        winnerName: winner.username,
-        forfeit: true,
-        eloDelta: eloRes.delta,
-        newElos: {
-          [winner.userId]: eloRes.newWinnerElo,
-          [loser.userId]: eloRes.newLoserElo,
-        },
-      });
-
-      if (match.player2.userId === 'bot_ai') {
-  this.scheduleBotTurn(match.matchId);
-}
-      break;
-    }
+    client.leave(roomCode);
+    this.socketToRoom.delete(client.id);
+    client.to(roomCode).emit('opponent_left');
+    this.rooms.delete(roomCode);
   }
 }
