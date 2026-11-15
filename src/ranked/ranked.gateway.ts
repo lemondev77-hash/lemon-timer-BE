@@ -53,9 +53,9 @@ function generateScramble(event: string): string {
     origin: '*',
   },
 })
-export class MatchGateway implements OnGatewayDisconnect {
+export class RankedGateway implements OnGatewayDisconnect {
   @WebSocketServer()
-  server: Server;
+  server!: Server;
 
   private rooms = new Map<string, MatchRoom>();
   private socketToRoom = new Map<string, string>();
@@ -290,7 +290,6 @@ export class MatchGateway implements OnGatewayDisconnect {
       timeMs,
     });
 
-    // Chờ đủ cả 2 người nộp giờ
     if (room.players.length < 2) return;
     const [p1, p2] = room.players;
     const t1 = room.roundTimes[p1.userId];
@@ -344,7 +343,6 @@ export class MatchGateway implements OnGatewayDisconnect {
       return;
     }
 
-    // Sang ván tiếp theo
     room.round += 1;
     room.roundTimes = {};
     room.scramble = generateScramble(room.event);
