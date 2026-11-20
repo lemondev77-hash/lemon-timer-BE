@@ -6,6 +6,7 @@ import { SolvesModule } from './solves/solves.module.js';
 import { LearningModule } from './learning/learning.module.js';
 import { AuthModule } from './auth/auth.module.js';
 import { RankedModule } from './ranked/ranked.module.js';
+import { SessionsModule } from './sessions/sessions.module.js';
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
@@ -23,6 +24,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     LearningModule,
     AuthModule,
     RankedModule,
+    SessionsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

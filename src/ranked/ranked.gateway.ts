@@ -7,6 +7,7 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
+import { RankedService } from './ranked.service.js';
 
 interface RoomPlayer {
   socketId: string;
@@ -57,6 +58,8 @@ export class RankedGateway implements OnGatewayDisconnect {
   @WebSocketServer()
   server!: Server;
 
+  constructor(private readonly rankedService: RankedService) {}
+
   private rooms = new Map<string, MatchRoom>();
   private socketToRoom = new Map<string, string>();
   private quickQueue = new Map<
@@ -73,6 +76,24 @@ export class RankedGateway implements OnGatewayDisconnect {
     this.socketToRoom.delete(client.id);
     const room = this.rooms.get(roomCode);
     if (!room) return;
+
+    // Nếu trận đang diễn ra mà một người thoát, cộng thắng cho người ở lại
+    if (room.players.length === 2 && room.round >= 1) {
+      const remaining = room.players.find((p) => p.socketId !== client.id);
+      const leaving = room.players.find((p) => p.socketId === client.id);
+      if (remaining && leaving) {
+        const delta = 15;
+        this.rankedService
+          .updateMatchStats(
+            remaining.userId,
+            leaving.userId,
+            remaining.elo + delta,
+            Math.max(800, leaving.elo - delta),
+            delta,
+          )
+          .catch(() => {});
+      }
+    }
 
     client.to(roomCode).emit('opponent_left');
     this.rooms.delete(roomCode);
@@ -141,9 +162,22 @@ export class RankedGateway implements OnGatewayDisconnect {
       return;
     }
 
+    const joinerUserId = String(payload?.userId || client.id);
+
+    // Ngăn chặn tự tham gia vào phòng thi đấu của chính mình
+    const isSelf = room.players.some(
+      (p) => p.socketId === client.id || (p.userId && p.userId === joinerUserId),
+    );
+    if (isSelf) {
+      client.emit('room_error', {
+        message: 'Bạn không thể tự tham gia phòng thi đấu của chính mình!',
+      });
+      return;
+    }
+
     const joiner: RoomPlayer = {
       socketId: client.id,
-      userId: String(payload?.userId || client.id),
+      userId: joinerUserId,
       name: String(payload?.name || 'Đối thủ'),
       elo: Number(payload?.elo ?? 1200),
       score: 0,
@@ -174,6 +208,14 @@ export class RankedGateway implements OnGatewayDisconnect {
     const name = String(payload?.name || 'Cuber');
     const elo = Number(payload?.elo ?? 1200);
 
+    // 1. Dọn dẹp hàng đợi: Nếu tài khoản này đã có socket khác đang chờ trong queue thì xóa socket cũ
+    for (const [sockId, entry] of this.quickQueue.entries()) {
+      if (entry.userId === userId || sockId === client.id) {
+        this.quickQueue.delete(sockId);
+      }
+    }
+
+    // 2. Tìm đối thủ: Phải khác socket, cùng môn thi, và TUYỆT ĐỐI không cùng userId
     let matchedEntry: {
       socketId: string;
       userId: string;
@@ -183,7 +225,7 @@ export class RankedGateway implements OnGatewayDisconnect {
     } | null = null;
 
     for (const [sockId, entry] of this.quickQueue.entries()) {
-      if (sockId !== client.id && entry.event === event) {
+      if (sockId !== client.id && entry.event === event && entry.userId !== userId) {
         matchedEntry = entry;
         break;
       }
@@ -311,12 +353,8 @@ export class RankedGateway implements OnGatewayDisconnect {
 
     if (p1.score >= winTarget) {
       matchWinnerId = p1.userId;
-      newElo[p1.userId] = p1.elo + 15;
-      newElo[p2.userId] = Math.max(800, p2.elo - 15);
     } else if (p2.score >= winTarget) {
       matchWinnerId = p2.userId;
-      newElo[p2.userId] = p2.elo + 15;
-      newElo[p1.userId] = Math.max(800, p1.elo - 15);
     }
 
     const finishedScramble = room.scramble;
@@ -324,6 +362,26 @@ export class RankedGateway implements OnGatewayDisconnect {
     const roundTimesSnapshot = { ...room.roundTimes };
 
     if (matchWinnerId) {
+      const isP1Win = matchWinnerId === p1.userId;
+      const winner = isP1Win ? p1 : p2;
+      const loser = isP1Win ? p2 : p1;
+
+      // Tính toán điểm Elo chuẩn cho trận đấu
+      const K = 32;
+      const expectedWin = 1 / (1 + Math.pow(10, (loser.elo - winner.elo) / 400));
+      const delta = Math.max(12, Math.min(32, Math.round(K * (1 - expectedWin))));
+
+      const winnerNewElo = winner.elo + delta;
+      const loserNewElo = Math.max(800, loser.elo - Math.round(delta * 0.85));
+
+      newElo[winner.userId] = winnerNewElo;
+      newElo[loser.userId] = loserNewElo;
+
+      // Lưu kết quả trận đấu, cập nhật số trận thắng, số trận thua và Elo vào DB
+      this.rankedService
+        .updateMatchStats(winner.userId, loser.userId, winnerNewElo, loserNewElo, delta)
+        .catch((err) => console.error('Lỗi cập nhật BXH DB:', err));
+
       this.server.to(roomCode).emit('round_result', {
         round: finishedRound,
         scramble: finishedScramble,

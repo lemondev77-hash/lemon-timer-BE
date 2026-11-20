@@ -186,6 +186,43 @@ export class RankedService implements OnModuleInit {
     return { delta, newWinnerElo, newLoserElo };
   }
 
+  async updateMatchStats(
+    winnerId: string,
+    loserId: string,
+    winnerNewElo: number,
+    loserNewElo: number,
+    delta: number,
+  ) {
+    try {
+      if (winnerId && !winnerId.startsWith('guest_') && winnerId !== 'guest') {
+        await this.pool.query(
+          `UPDATE player_ratings
+           SET elo = $1, wins = wins + 1, updated_at = CURRENT_TIMESTAMP
+           WHERE user_id = $2`,
+          [winnerNewElo, winnerId],
+        );
+      }
+
+      if (loserId && !loserId.startsWith('guest_') && loserId !== 'guest') {
+        await this.pool.query(
+          `UPDATE player_ratings
+           SET elo = $1, losses = losses + 1, updated_at = CURRENT_TIMESTAMP
+           WHERE user_id = $2`,
+          [loserNewElo, loserId],
+        );
+      }
+
+      const matchId = randomUUID();
+      await this.pool.query(
+        `INSERT INTO ranked_matches (id, player1_id, player2_id, winner_id, status, elo_delta)
+         VALUES ($1, $2, $3, $4, 'COMPLETED', $5)`,
+        [matchId, winnerId, loserId, winnerId, delta],
+      );
+    } catch (err) {
+      console.error('Lỗi cập nhật bảng xếp hạng trong DB:', err);
+    }
+  }
+
   async getLeaderboard() {
     const res = await this.pool.query(`
       SELECT u.id, u.username, r.elo, r.wins, r.losses
